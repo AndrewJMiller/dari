@@ -60,21 +60,27 @@ public class CodeDebugServlet extends HttpServlet {
 
     private static File getFile(WebPageContext page) {
         String file = page.param(String.class, "file");
-        if (ObjectUtils.isBlank(file)) {
+
+        if (file == null) {
             String servletPath = page.param(String.class, "servletPath");
-            if (!ObjectUtils.isBlank(servletPath)) {
+
+            if (servletPath != null) {
                 file = page.getServletContext().getRealPath(servletPath);
             }
         }
 
-        if (!ObjectUtils.isBlank(file)) {
-            File fileInstance = new File(file);
-            if (fileInstance.exists()) {
-                return fileInstance;
-            }
+        if (file == null) {
+            return null;
         }
 
-        return null;
+        File fileInstance = new File(file);
+
+        if (!fileInstance.exists()) {
+            File parent = fileInstance.getParentFile();
+            parent.mkdirs();
+        }
+
+        return fileInstance;
     }
 
     private void doSave(WebPageContext page) throws IOException, ServletException {
@@ -84,27 +90,49 @@ public class CodeDebugServlet extends HttpServlet {
 
         new DebugFilter.PageWriter(page) {{
             File file = getFile(page);
-            if (file == null) {
-                throw new IllegalArgumentException();
-            }
-
-            FileOutputStream fileOutput = new FileOutputStream(file);
+            ErrorUtils.errorIfNull(file, "file");
+            String code = page.paramOrDefault(String.class, "code", "");
 
             try {
-                fileOutput.write(page.paramOrDefault(String.class, "code", "").replaceAll("(?:\r\n|[\r\n])", "\n").getBytes("UTF-8"));
-                start("p", "class", "alert alert-success");
-                    html("Saved Successfully! (");
-                    object(new Date());
-                    html(")");
-                end();
+                CLASS_FOUND:
+                    if (file.isDirectory()) {
+                        Object result = CodeUtils.evaluateJava(code);
+
+                        if (result instanceof Collection) {
+                            for (Object item : (Collection<?>) result) {
+                                if (item instanceof Class) {
+                                    file = new File(file, ((Class<?>) item).getName().replace('.', File.separatorChar) + ".java");
+                                    file.getParentFile().mkdirs();
+                                    break CLASS_FOUND;
+                                }
+                            }
+                        }
+
+                        throw new IllegalArgumentException("Syntax error!");
+                    }
+
+                if (!file.exists()) {
+                    file.createNewFile();
+                }
+
+                FileOutputStream fileOutput = new FileOutputStream(file);
+
+                try {
+                    fileOutput.write(code.replaceAll("(?:\r\n|[\r\n])", "\n").getBytes("UTF-8"));
+                    start("p", "class", "alert alert-success");
+                        html("Saved Successfully! (");
+                        object(new Date());
+                        html(")");
+                    end();
+
+                } finally {
+                    fileOutput.close();
+                }
 
             } catch (Exception ex) {
                 start("pre", "class", "alert alert-error");
                     object(ex);
                 end();
-
-            } finally {
-                fileOutput.close();
             }
         }};
     }
@@ -115,7 +143,47 @@ public class CodeDebugServlet extends HttpServlet {
         final StringBuilder codeBuilder = new StringBuilder();
 
         if (file != null) {
-            codeBuilder.append(IoUtils.toString(file, StringUtils.UTF_8));
+            if (file.exists()) {
+                if (file.isDirectory()) {
+
+                } else {
+                    codeBuilder.append(IoUtils.toString(file, StringUtils.UTF_8));
+                }
+
+            } else {
+                String filePath = file.getPath();
+
+                if (filePath.endsWith(".java")) {
+                    filePath = filePath.substring(0, filePath.length() - 5);
+
+                    for (File sourceDirectory : CodeUtils.getSourceDirectories()) { String sourceDirectoryPath = sourceDirectory.getPath();
+
+                        if (filePath.startsWith(sourceDirectoryPath)) {
+                            String classPath = filePath.substring(sourceDirectoryPath.length());
+
+                            if (classPath.startsWith(File.separator)) {
+                                classPath = classPath.substring(1);
+                            }
+
+                            int lastSepAt = classPath.lastIndexOf(File.separatorChar);
+
+                            if (lastSepAt < 0) {
+                                codeBuilder.append("public class ");
+                                codeBuilder.append(classPath);
+
+                            } else {
+                                codeBuilder.append("package ");
+                                codeBuilder.append(classPath.substring(0, lastSepAt).replace(File.separatorChar, '.'));
+                                codeBuilder.append(";\n\npublic class ");
+                                codeBuilder.append(classPath.substring(lastSepAt + 1));
+                            }
+
+                            codeBuilder.append(" {\n}");
+                            break;
+                        }
+                    }
+                }
+            }
 
         } else {
             Set<String> packages = findPackages();
@@ -150,7 +218,7 @@ public class CodeDebugServlet extends HttpServlet {
         }
 
         new DebugFilter.PageWriter(page) {{
-            List<Object> inputs = Static.getInputs(getServletContext());
+            List<Object> inputs = CodeDebugServlet.Static.getInputs(getServletContext());
             Object input = inputs == null || inputs.isEmpty() ? null : inputs.get(0);
             String name;
             
@@ -191,29 +259,6 @@ public class CodeDebugServlet extends HttpServlet {
                     start("div",
                             "class", input != null ? "span9" : "span12",
                             "style", input != null ? "margin-left: 20%" : null);
-                        start("form",
-                                "action", page.url(null),
-                                "method", "get",
-                                "style", "margin: 0");
-                            start("h2");
-                                html(type).html(" Code");
-                                html(' ');
-                                start("select",
-                                        "class", "span6",
-                                        "name", "file",
-                                        "onchange", "$(this).closest('form').submit();");
-                                    start("option", "value", "");
-                                        html("- NEW -");
-                                    end();
-                                    for (File sourceDirectory : CodeUtils.getSourceDirectories()) {
-                                        start("optgroup", "label", sourceDirectory);
-                                            writeFileOption(file, sourceDirectory, sourceDirectory);
-                                        end();
-                                    }
-                                end();
-                            end();
-                        end();
-
                         start("form",
                                 "action", page.url(null),
                                 "class", "code",
@@ -315,6 +360,56 @@ public class CodeDebugServlet extends HttpServlet {
             endPage();
         }
 
+            @Override
+            public void startBody(String... titles) throws IOException {
+                start("body");
+                    start("div", "class", "navbar navbar-fixed-top");
+                        start("div", "class", "navbar-inner");
+                            start("div", "class", "container-fluid");
+                                start("span", "class", "brand");
+                                    start("a", "href", DebugFilter.Static.getServletPath(page.getRequest(), ""));
+                                        html("Dari");
+                                    end();
+                                    html("Code Editor \u2192 ");
+                                end();
+
+                                start("form",
+                                        "action", page.url(null),
+                                        "method", "get",
+                                        "style", "float: left; height: 40px; line-height: 40px; margin: 0; padding-left: 10px;");
+                                    start("select",
+                                            "class", "span6",
+                                            "name", "file",
+                                            "onchange", "$(this).closest('form').submit();");
+                                        start("option", "value", "");
+                                            html("PLAYGROUND");
+                                        end();
+                                        for (File sourceDirectory : CodeUtils.getSourceDirectories()) {
+                                            start("optgroup", "label", sourceDirectory);
+                                                start("option",
+                                                        "selected", sourceDirectory.equals(file) ? "selected" : null,
+                                                        "value", sourceDirectory);
+                                                    html("NEW CLASS IN ").html(sourceDirectory);
+                                                end();
+                                                writeFileOption(file, sourceDirectory, sourceDirectory);
+                                            end();
+                                        }
+                                    end();
+                                end();
+
+                                includeStylesheet("/_resource/chosen/chosen.css");
+                                includeScript("/_resource/chosen/chosen.jquery.min.js");
+                                start("script", "type", "text/javascript");
+                                    write("(function() {");
+                                        write("$('select[name=file]').chosen({ 'search_contains': true });");
+                                    write("})();");
+                                end();
+                            end();
+                        end();
+                    end();
+                    start("div", "class", "container-fluid", "style", "padding-top: 54px;");
+            }
+
             private void writeFileOption(File file, File sourceDirectory, File source) throws IOException {
                 if (source.isDirectory()) {
                     for (File child : source.listFiles()) {
@@ -377,7 +472,7 @@ public class CodeDebugServlet extends HttpServlet {
                             for (Object item : (Collection<?>) result) {
 
                                 if (item instanceof Class) {
-                                    List<Object> inputs = Static.getInputs(page.getServletContext());
+                                    List<Object> inputs = CodeDebugServlet.Static.getInputs(page.getServletContext());
                                     Object input = inputs == null || inputs.isEmpty() ? null : inputs.get(0);
 
                                     if (input != null) {

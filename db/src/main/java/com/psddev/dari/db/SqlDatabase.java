@@ -5,6 +5,7 @@ import com.jolbox.bonecp.BoneCPDataSource;
 import com.psddev.dari.util.ObjectUtils;
 import com.psddev.dari.util.PaginatedResult;
 import com.psddev.dari.util.PeriodicValue;
+import com.psddev.dari.util.Profiler;
 import com.psddev.dari.util.PullThroughValue;
 import com.psddev.dari.util.Settings;
 import com.psddev.dari.util.SettingsException;
@@ -101,9 +102,12 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
     public static final String ORIGINAL_DATA_EXTRA = "sql.originalData";
 
     private static final Logger LOGGER = LoggerFactory.getLogger(SqlDatabase.class);
-    private static final Stats STATS = new Stats("SQL");
-    private static final String QUERY_OPERATION = "Query";
-    private static final String UPDATE_OPERATION = "Update";
+    private static final String SHORT_NAME = "SQL";
+    private static final Stats STATS = new Stats(SHORT_NAME);
+    private static final String QUERY_STATS_OPERATION = "Query";
+    private static final String UPDATE_STATS_OPERATION = "Update";
+    private static final String QUERY_PROFILER_EVENT = SHORT_NAME + " " + QUERY_STATS_OPERATION;
+    private static final String UPDATE_PROFILER_EVENT = SHORT_NAME + " " + UPDATE_STATS_OPERATION;
 
     private final static List<SqlDatabase> INSTANCES = new ArrayList<SqlDatabase>();
 
@@ -188,8 +192,19 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
 
         synchronized (this) {
             try {
+                boolean writable = false;
+
                 if (vendor == null) {
-                    Connection connection = openConnection();
+                    Connection connection;
+
+                    try {
+                        connection = openConnection();
+                        writable = true;
+
+                    } catch (DatabaseException error) {
+                        LOGGER.debug("Can't read vendor information from the writable server!", error);
+                        connection = openReadConnection();
+                    }
 
                     try {
                         DatabaseMetaData meta = connection.getMetaData();
@@ -211,21 +226,23 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
                 tableNames.refresh();
                 symbols.invalidate();
 
-                vendor.createRecord(this);
-                vendor.createRecordUpdate(this);
-                vendor.createSymbol(this);
+                if (writable) {
+                    vendor.createRecord(this);
+                    vendor.createRecordUpdate(this);
+                    vendor.createSymbol(this);
 
-                for (SqlIndex index : SqlIndex.values()) {
-                    if (index != SqlIndex.CUSTOM) {
-                        vendor.createRecordIndex(
-                                this,
-                                index.getReadTable(this, null).getName(this, null),
-                                index);
+                    for (SqlIndex index : SqlIndex.values()) {
+                        if (index != SqlIndex.CUSTOM) {
+                            vendor.createRecordIndex(
+                                    this,
+                                    index.getReadTable(this, null).getName(this, null),
+                                    index);
+                        }
                     }
-                }
 
-                tableNames.refresh();
-                symbols.invalidate();
+                    tableNames.refresh();
+                    symbols.invalidate();
+                }
 
             } catch (SQLException ex) {
                 throw new SqlDatabaseException(this, "Can't check for required tables!", ex);
@@ -303,7 +320,15 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
                 return Collections.emptySet();
             }
 
-            Connection connection = openConnection();
+            Connection connection;
+
+            try {
+                connection = openConnection();
+
+            } catch (DatabaseException error) {
+                LOGGER.debug("Can't read table names from the writable server!", error);
+                connection = openReadConnection();
+            }
 
             try {
                 SqlVendor vendor = getVendor();
@@ -428,9 +453,17 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
             vendor.appendIdentifier(selectBuilder, SYMBOL_TABLE);
 
             String selectSql = selectBuilder.toString();
-            Connection connection = openConnection();
+            Connection connection;
             Statement statement = null;
             ResultSet result = null;
+
+            try {
+                connection = openConnection();
+
+            } catch (DatabaseException error) {
+                LOGGER.debug("Can't read symbols from the writable server!", error);
+                connection = openReadConnection();
+            }
 
             try {
                 statement = connection.createStatement();
@@ -545,12 +578,26 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
         }
     }
 
-    private byte[] serializeData(Map<String, Object> dataMap) {
-        byte[] dataBytes = ObjectUtils.toJson(dataMap).getBytes(StringUtils.UTF_8);
+    private byte[] serializeState(State state) {
+        Map<String, Object> values = state.getSimpleValues();
+
+        for (Iterator<Map.Entry<String, Object>> i = values.entrySet().iterator(); i.hasNext(); ) {
+            Map.Entry<String, Object> entry = i.next();
+            ObjectField field = state.getField(entry.getKey());
+
+            if (field != null) {
+                if (field.as(FieldData.class).isIndexTableSourceFromAnywhere()) {
+                    i.remove();
+                }
+            }
+        }
+
+        byte[] dataBytes = ObjectUtils.toJson(values).getBytes(StringUtils.UTF_8);
 
         if (isCompressData()) {
             byte[] compressed = new byte[Snappy.maxCompressedLength(dataBytes.length)];
             int compressedLength = Snappy.compress(dataBytes, 0, dataBytes.length, compressed, 0);
+
             dataBytes = new byte[compressedLength + 1];
             dataBytes[0] = 's';
             System.arraycopy(compressed, 0, dataBytes, 1, compressedLength);
@@ -604,10 +651,124 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
 
         ResultSetMetaData meta = resultSet.getMetaData();
         for (int i = 4, count = meta.getColumnCount(); i <= count; ++ i) {
-            objectState.getExtras().put(EXTRA_COLUMN_EXTRA_PREFIX + meta.getColumnLabel(i), resultSet.getObject(i));
+            String columnName = meta.getColumnLabel(i);
+            if (query.getExtraSourceColumns().contains(columnName)) {
+                objectState.put(columnName, resultSet.getObject(i));
+            } else {
+                objectState.getExtras().put(EXTRA_COLUMN_EXTRA_PREFIX + meta.getColumnLabel(i), resultSet.getObject(i));
+            }
+        }
+
+        // Load some extra column from source index tables.
+        Set<ObjectType> queryTypes = query.getConcreteTypes(getEnvironment());
+        ObjectType type = objectState.getType();
+        HashSet<ObjectField> loadExtraFields = new HashSet<ObjectField>();
+
+        if (type != null) {
+            for (ObjectField field : type.getFields()) {
+                SqlDatabase.FieldData fieldData = field.as(SqlDatabase.FieldData.class);
+
+                if (fieldData.isIndexTableSource() &&
+                        !queryTypes.contains(type)) {
+                    loadExtraFields.add(field);
+                }
+            }
+        }
+
+        if (loadExtraFields != null) {
+            Connection connection = openQueryConnection(query);
+
+            try {
+                for (ObjectField field : loadExtraFields) {
+                    Statement extraStatement = null;
+                    ResultSet extraResult = null;
+
+                    try {
+                        extraStatement = connection.createStatement();
+                        extraResult = executeQueryBeforeTimeout(
+                                extraStatement,
+                                extraSourceSelectStatementById(field, objectState.getId()),
+                                getQueryReadTimeout(query));
+
+                        if (extraResult.next()) {
+                            meta = extraResult.getMetaData();
+
+                            for (int i = 1, count = meta.getColumnCount(); i <= count; ++ i) {
+                                objectState.put(meta.getColumnLabel(i), extraResult.getObject(i));
+                            }
+                        }
+
+                    } finally {
+                        closeResources(null, extraStatement, extraResult);
+                    }
+                }
+
+            } finally {
+                closeConnection(connection);
+            }
         }
 
         return swapObjectType(query, object);
+    }
+
+    // Creates an SQL statement to return a single row from a FieldIndexTable
+    // used as a source table.
+    //
+    // TODO, maybe: move this to SqlQuery and use initializeClauses() and
+    // needsRecordTable=false instead of passing id to this method. Needs
+    // countperformance branch to do this.
+    private String extraSourceSelectStatementById(ObjectField field, UUID id) {
+        FieldData fieldData = field.as(FieldData.class);
+        ObjectType parentType = field.getParentType();
+        StringBuilder keyName = new StringBuilder(parentType.getInternalName());
+
+        keyName.append("/");
+        keyName.append(field.getInternalName());
+
+        Query<?> query = Query.fromType(parentType);
+        Query.MappedKey key = query.mapEmbeddedKey(getEnvironment(), keyName.toString());
+        ObjectIndex useIndex = null;
+
+        for (ObjectIndex index : key.getIndexes()) {
+            if (index.getFields().get(0) == field.getInternalName()) {
+                useIndex = index;
+                break;
+            }
+        }
+
+        SqlIndex useSqlIndex = SqlIndex.Static.getByIndex(useIndex);
+        SqlIndex.Table indexTable = useSqlIndex.getReadTable(this, useIndex);
+        String sourceTableName = fieldData.getIndexTable();
+        int symbolId = getSymbolId(key.getIndexKey(useIndex));
+        StringBuilder sql = new StringBuilder();
+        int fieldIndex = 0;
+
+        sql.append("SELECT ");
+
+        for (String indexFieldName : useIndex.getFields()) {
+            String indexColumnName = indexTable.getValueField(this, useIndex, fieldIndex);
+
+            ++ fieldIndex;
+
+            vendor.appendIdentifier(sql, indexColumnName);
+            sql.append(" AS ");
+            vendor.appendIdentifier(sql, indexFieldName);
+            sql.append(", ");
+        }
+
+        sql.setLength(sql.length() - 2);
+        sql.append(" FROM ");
+        vendor.appendIdentifier(sql, sourceTableName);
+        sql.append(" WHERE ");
+        vendor.appendIdentifier(sql, "id");
+        sql.append(" = ");
+        vendor.appendValue(sql, id);
+        sql.append(" AND ");
+        vendor.appendIdentifier(sql, "symbolId");
+        sql.append(" = ");
+        sql.append(symbolId);
+
+        return sql.toString();
     }
 
     /**
@@ -625,11 +786,15 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
         }
 
         Stats.Timer timer = STATS.startTimer();
+        Profiler.Static.startThreadEvent(QUERY_PROFILER_EVENT);
+
         try {
             return statement.executeQuery(sqlQuery);
 
         } finally {
-            double duration = timer.stop(QUERY_OPERATION);
+            double duration = timer.stop(QUERY_STATS_OPERATION);
+            Profiler.Static.stopThreadEvent(sqlQuery);
+
             LOGGER.debug(
                     "Read from the SQL database using [{}] in [{}]ms",
                     sqlQuery, duration);
@@ -739,7 +904,7 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
             query = initialQuery;
 
             try {
-                connection = openConnection();
+                connection = openReadConnection();
                 statement = connection.createStatement();
                 statement.setFetchSize(
                         getVendor() instanceof SqlVendor.MySQL ? Integer.MIN_VALUE :
@@ -959,14 +1124,6 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
     @Override
     protected void doInitialize(String settingsKey, Map<String, Object> settings) {
         close();
-        setDataSource(createDataSource(
-                settings,
-                DATA_SOURCE_SETTING,
-                JDBC_DRIVER_CLASS_SETTING,
-                JDBC_URL_SETTING,
-                JDBC_USER_SETTING,
-                JDBC_PASSWORD_SETTING,
-                JDBC_POOL_SIZE_SETTING));
         setReadDataSource(createDataSource(
                 settings,
                 READ_DATA_SOURCE_SETTING,
@@ -975,6 +1132,14 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
                 READ_JDBC_USER_SETTING,
                 READ_JDBC_PASSWORD_SETTING,
                 READ_JDBC_POOL_SIZE_SETTING));
+        setDataSource(createDataSource(
+                settings,
+                DATA_SOURCE_SETTING,
+                JDBC_DRIVER_CLASS_SETTING,
+                JDBC_URL_SETTING,
+                JDBC_USER_SETTING,
+                JDBC_PASSWORD_SETTING,
+                JDBC_POOL_SIZE_SETTING));
 
         String vendorClassName = ObjectUtils.to(String.class, settings.get(VENDOR_CLASS_SETTING));
         Class<?> vendorClass = null;
@@ -1512,7 +1677,7 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
                 if (isNew) {
                     try {
                         if (dataBytes == null) {
-                            dataBytes = serializeData(state.getSimpleValues());
+                            dataBytes = serializeState(state);
                         }
 
                         List<Object> parameters = new ArrayList<Object>();
@@ -1560,7 +1725,7 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
                     List<AtomicOperation> atomicOperations = state.getAtomicOperations();
                     if (atomicOperations.isEmpty()) {
                         if (dataBytes == null) {
-                            dataBytes = serializeData(state.getSimpleValues());
+                            dataBytes = serializeState(state);
                         }
 
                         List<Object> parameters = new ArrayList<Object>();
@@ -1621,7 +1786,7 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
                             operation.execute(state);
                         }
 
-                        dataBytes = serializeData(state.getSimpleValues());
+                        dataBytes = serializeState(state);
 
                         List<Object> parameters = new ArrayList<Object>();
                         StringBuilder updateBuilder = new StringBuilder();
@@ -1811,6 +1976,76 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
         Static.executeUpdateWithArray(connection, updateBuilder.toString());
     }
 
+    @FieldData.FieldInternalNamePrefix("sql.")
+    public static class FieldData extends Modification<ObjectField> {
+
+        private String indexTable;
+        private boolean indexTableReadOnly;
+        private boolean indexTableSameColumnNames;
+        private boolean indexTableSource;
+
+        public String getIndexTable() {
+            return indexTable;
+        }
+
+        public void setIndexTable(String indexTable) {
+            this.indexTable = indexTable;
+        }
+
+        public boolean isIndexTableReadOnly() {
+            return indexTableReadOnly;
+        }
+
+        public void setIndexTableReadOnly(boolean indexTableReadOnly) {
+            this.indexTableReadOnly = indexTableReadOnly;
+        }
+
+        public boolean isIndexTableSameColumnNames() {
+            return indexTableSameColumnNames;
+        }
+
+        public void setIndexTableSameColumnNames(boolean indexTableSameColumnNames) {
+            this.indexTableSameColumnNames = indexTableSameColumnNames;
+        }
+
+        public boolean isIndexTableSource() {
+            return indexTableSource;
+        }
+
+        public void setIndexTableSource(boolean indexTableSource) {
+            this.indexTableSource = indexTableSource;
+        }
+
+        public boolean isIndexTableSourceFromAnywhere() {
+            if (isIndexTableSource()) {
+                return true;
+            }
+
+            ObjectField field = getOriginalObject();
+            ObjectStruct parent = field.getParent();
+            String fieldName = field.getInternalName();
+
+            for (ObjectIndex index : parent.getIndexes()) {
+                List<String> indexFieldNames = index.getFields();
+
+                if (!indexFieldNames.isEmpty() &&
+                        indexFieldNames.contains(fieldName)) {
+                    String firstIndexFieldName = indexFieldNames.get(0);
+
+                    if (!fieldName.equals(firstIndexFieldName)) {
+                        ObjectField firstIndexField = parent.getField(firstIndexFieldName);
+
+                        if (firstIndexField != null) {
+                            return firstIndexField.as(FieldData.class).isIndexTableSource();
+                        }
+                    }
+                }
+            }
+
+            return false;
+        }
+    }
+
     /** Specifies the name of the table for storing target field values. */
     @Documented
     @ObjectField.AnnotationProcessorClass(FieldIndexTableProcessor.class)
@@ -1818,12 +2053,20 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
     @Target(ElementType.FIELD)
     public @interface FieldIndexTable {
         String value();
+        boolean readOnly() default false;
+        boolean sameColumnNames() default false;
+        boolean source() default false;
     }
 
     private static class FieldIndexTableProcessor implements ObjectField.AnnotationProcessor<FieldIndexTable> {
         @Override
         public void process(ObjectType type, ObjectField field, FieldIndexTable annotation) {
-            field.getOptions().put(INDEX_TABLE_INDEX_OPTION, annotation.value());
+            FieldData data = field.as(FieldData.class);
+
+            data.setIndexTable(annotation.value());
+            data.setIndexTableSameColumnNames(annotation.sameColumnNames());
+            data.setIndexTableSource(annotation.source());
+            data.setIndexTableReadOnly(annotation.readOnly());
         }
     }
 
@@ -1933,7 +2176,7 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
                 String sqlQuery,
                 List<? extends List<?>> parameters) throws SQLException {
 
-            PreparedStatement prepared = connection.prepareCall(sqlQuery);
+            PreparedStatement prepared = connection.prepareStatement(sqlQuery);
             List<?> currentRow = null;
 
             try {
@@ -1951,12 +2194,15 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
 
                 int[] affected = null;
                 Stats.Timer timer = STATS.startTimer();
+                Profiler.Static.startThreadEvent(UPDATE_PROFILER_EVENT);
 
                 try {
                     return (affected = prepared.executeBatch());
 
                 } finally {
-                    double time = timer.stop(UPDATE_OPERATION);
+                    double time = timer.stop(UPDATE_STATS_OPERATION);
+                    Profiler.Static.stopThreadEvent(sqlQuery);
+
                     if (LOGGER.isDebugEnabled()) {
                         LOGGER.debug(
                                 "SQL batch update: [{}], Parameters: {}, Affected: {}, Time: [{}]ms",
@@ -2031,6 +2277,7 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
 
                 Integer affected = null;
                 Stats.Timer timer = STATS.startTimer();
+                Profiler.Static.startThreadEvent(UPDATE_PROFILER_EVENT);
 
                 try {
                     return (affected = hasParameters ?
@@ -2038,7 +2285,9 @@ public class SqlDatabase extends AbstractDatabase<Connection> {
                             statement.executeUpdate(sqlQuery));
 
                 } finally {
-                    double time = timer.stop(UPDATE_OPERATION);
+                    double time = timer.stop(UPDATE_STATS_OPERATION);
+                    Profiler.Static.stopThreadEvent(sqlQuery);
+
                     if (LOGGER.isDebugEnabled()) {
                         LOGGER.debug(
                                 "SQL update: [{}], Affected: [{}], Time: [{}]ms",

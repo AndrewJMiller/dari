@@ -1,5 +1,6 @@
 package com.psddev.dari.db;
 
+import com.psddev.dari.util.CollectionUtils;
 import com.psddev.dari.util.ObjectUtils;
 
 import java.util.ArrayList;
@@ -11,6 +12,7 @@ import java.util.ListIterator;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Queue;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -214,16 +216,33 @@ public class PredicateParser {
             tokens.add(tokenBuilder.toString());
         }
 
-        Queue<Object> parameterQueue = new LinkedList<Object>();
-        if (parameters != null) {
-            Collections.addAll(parameterQueue, parameters);
+        return readPredicate(tokens, new ParameterList(parameters));
+    }
+
+    @SuppressWarnings("serial")
+    private static class ParameterList extends ArrayList<Object> {
+
+        private int next;
+
+        public ParameterList(Object... parameters) {
+            if (parameters != null && parameters.length > 0) {
+                Collections.addAll(this, parameters);
+            }
         }
 
-        return readPredicate(tokens, parameterQueue);
+        public Object poll() {
+            if (next < size()) {
+                Object item = get(next);
+                ++ next;
+                return item;
+            } else {
+                return null;
+            }
+        }
     }
 
     // Reads: group (compoundOperator group)*
-    private Predicate readPredicate(Queue<String> tokens, Queue<Object> parameters) {
+    private Predicate readPredicate(Queue<String> tokens, ParameterList parameters) {
         Predicate predicate = readGroup(tokens, parameters);
 
         if (predicate != null) {
@@ -247,7 +266,7 @@ public class PredicateParser {
     }
 
     // Reads: '(' predicate ')'
-    private Predicate readGroup(Queue<String> tokens, Queue<Object> parameters) {
+    private Predicate readGroup(Queue<String> tokens, ParameterList parameters) {
         Predicate predicate = null;
         String nextToken = tokens.peek();
 
@@ -307,7 +326,7 @@ public class PredicateParser {
     }
 
     // Reads: key operator value
-    private Predicate readComparison(Queue<String> tokens, Queue<Object> parameters) {
+    private Predicate readComparison(Queue<String> tokens, ParameterList parameters) {
         String key = tokens.poll();
         if (key == null) {
             return null;
@@ -340,8 +359,42 @@ public class PredicateParser {
         } else if (value instanceof String) {
             String valueString = (String) value;
 
-            if ("?".equals(valueString)) {
-                value = parameters.poll();
+            if (valueString.startsWith("?")) {
+                if (valueString.length() == 1) {
+                    value = parameters.poll();
+
+                } else {
+                    String path = valueString.substring(1);
+                    int slashAt = path.indexOf('/');
+                    String splitIndex;
+                    String splitPath;
+
+                    if (slashAt > -1) {
+                        splitIndex = path.substring(0, slashAt);
+                        splitPath = path.substring(slashAt + 1);
+                    } else {
+                        splitIndex = path;
+                        splitPath = "";
+                    }
+
+                    Integer index = ObjectUtils.to(Integer.class, splitIndex);
+
+                    if (index == null) {
+                        index = 0;
+                    } else {
+                        path = splitPath;
+                    }
+
+                    value = index < parameters.size() ? parameters.get(index) : null;
+
+                    if (value != null && path.length() > 0) {
+                        if (value instanceof Recordable) {
+                            value = ((Recordable) value).getState().getValue(path);
+                        } else {
+                            value = CollectionUtils.getByPath(value, path);
+                        }
+                    }
+                }
 
             } else if ("true".equalsIgnoreCase(valueString)) {
                 value = Boolean.TRUE;
@@ -431,14 +484,28 @@ public class PredicateParser {
 
             if (keyValue == null) {
                 keyValue = Query.MISSING_VALUE;
+                return compare(state, keyValue, values);
+
+            } else if (keyValue instanceof Iterable) {
+                for (Object item : (Iterable<?>) keyValue) {
+                    if (evaluateOne(state, item, values)) {
+                        return true;
+                    }
+                }
+                return false;
 
             } else {
+                return evaluateOne(state, keyValue, values);
+            }
+        }
+
+        private boolean evaluateOne(State state, Object keyValue, List<Object> values) {
+            if (!(keyValue instanceof Recordable || keyValue instanceof UUID)) {
                 Class<?> keyValueClass = keyValue.getClass();
                 for (ListIterator<Object> i = values.listIterator(); i.hasNext(); ) {
                     i.set(ObjectUtils.to(keyValueClass, i.next()));
                 }
             }
-
             return compare(state, keyValue, values);
         }
 
@@ -460,13 +527,25 @@ public class PredicateParser {
 
             } else {
                 for (Object value : values) {
-                    if (keyValue.equals(value)) {
+                    if (getIdOrObject(keyValue).equals(getIdOrObject(value))) {
                         return true;
                     }
                 }
             }
 
             return false;
+        }
+
+        private Object getIdOrObject(Object object) {
+            if (object instanceof Recordable) {
+                return ((Recordable) object).getState().getId();
+
+            } else if (object instanceof State) {
+                return ((State) object).getId();
+
+            } else {
+                return object;
+            }
         }
     }
 

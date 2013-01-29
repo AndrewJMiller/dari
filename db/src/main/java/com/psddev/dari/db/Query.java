@@ -125,6 +125,7 @@ public class Query<E> extends Record implements Cloneable, HtmlObject {
     private boolean isResolveToReferenceOnly;
     private Double timeout;
     private transient Map<String, Object> options;
+    private transient HashSet<String> extraSourceColumns = new HashSet<String>();
 
     private final transient Map<String, Object> facetedFields = new HashMap<String, Object>();
     private transient Query<?> facetedQuery;
@@ -244,8 +245,32 @@ public class Query<E> extends Record implements Cloneable, HtmlObject {
      */
     public Database getDatabase() {
         if (database == null) {
-            database = Database.Static.getDefault();
+            Database defaultDatabase = Database.Static.getDefault();
+            Database source = null;
+
+            // Change the query database if it's only querying over a single
+            // type that has a source database.
+            for (ObjectType groupType : defaultDatabase.getEnvironment().getTypesByGroup(getGroup())) {
+                for (ObjectType type : groupType.findConcreteTypes()) {
+                    Database typeSource = type.getSourceDatabase();
+
+                    if (typeSource == null) {
+                        source = null;
+                        break;
+
+                    } else if (source == null) {
+                        source = typeSource;
+
+                    } else if (!source.equals(typeSource)) {
+                        source = null;
+                        break;
+                    }
+                }
+            }
+
+            database = source != null ? source : defaultDatabase;
         }
+
         return database;
     }
 
@@ -556,7 +581,7 @@ public class Query<E> extends Record implements Cloneable, HtmlObject {
         return types;
     }
 
-    private MappedKey mapKey(DatabaseEnvironment environment, String key, boolean embeddedCheck) {
+    private MappedKey mapKey(DatabaseEnvironment environment, String key, boolean checkDenormalized) {
         MappedKey specialMappedKey = SPECIAL_MAPPED_KEYS.get(key);
         if (specialMappedKey != null) {
             return specialMappedKey;
@@ -579,7 +604,6 @@ public class Query<E> extends Record implements Cloneable, HtmlObject {
         String keyFirst;
         String keyRest = key;
         ObjectType type;
-        ObjectField field;
         Set<ObjectType> subQueryTypes = null;
         String subQueryKey = null;
 
@@ -600,7 +624,8 @@ public class Query<E> extends Record implements Cloneable, HtmlObject {
                 fieldTypes = Collections.singleton(type);
 
             } else {
-                field = environment.getField(keyFirst);
+                ObjectField field = environment.getField(keyFirst);
+
                 if (field == null) {
                     for (ObjectType fieldType : fieldTypes) {
                         field = fieldType.getField(keyFirst);
@@ -612,33 +637,36 @@ public class Query<E> extends Record implements Cloneable, HtmlObject {
                 }
 
                 if (field != null) {
-                    if (embeddedCheck) {
-                        if (hasMore && ObjectField.RECORD_TYPE.equals(field.getInternalItemType())) {
-                            boolean isEmbedded = field.isEmbedded();
+                    if (hasMore && ObjectField.RECORD_TYPE.equals(field.getInternalItemType())) {
+                        boolean isEmbedded = field.isEmbedded();
+
+                        if (!isEmbedded) {
+                            for (ObjectType fieldType : fieldTypes) {
+                                if (fieldType.isEmbedded()) {
+                                    isEmbedded = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (checkDenormalized && !isEmbedded) {
+                            isEmbedded = field.isDenormalized();
 
                             if (!isEmbedded) {
                                 for (ObjectType fieldType : fieldTypes) {
-                                    if (fieldType.isEmbedded()) {
+                                    if (fieldType.isDenormalized()) {
                                         isEmbedded = true;
                                         break;
                                     }
                                 }
                             }
-
-                            if (!isEmbedded) {
-                                hasMore = false;
-                                subQueryTypes = fieldTypes;
-                                subQueryKey = keyRest;
-                            }
                         }
 
-                    } else if (!ObjectField.RECORD_TYPE.equals(field.getInternalItemType()) &&
-                            fields != null &&
-                            !field.isDenormalized()) {
-                        hasMore = false;
-                        subQueryTypes = fieldTypes;
-                        subQueryKey = keyRest;
-                        break;
+                        if (!isEmbedded) {
+                            hasMore = false;
+                            subQueryTypes = fieldTypes;
+                            subQueryKey = keyRest;
+                        }
                     }
 
                     if (fields == null) {
@@ -657,17 +685,21 @@ public class Query<E> extends Record implements Cloneable, HtmlObject {
             throw new NoFieldException(getGroup(), key);
         }
 
-        ObjectField lastField = fields.get(fields.size() - 1);
-        String lastFieldName = lastField.getInternalName();
         Set<ObjectIndex> indexes = new HashSet<ObjectIndex>();
-        for (ObjectIndex index : lastField.getParent().getIndexes()) {
-            if (index.getFields().contains(lastFieldName)) {
-                indexes.add(index);
-            }
-        }
 
-        if (indexes.isEmpty()) {
-            throw new NoIndexException(lastField);
+        for (ObjectField field : fields) {
+            String fieldName = field.getInternalName();
+            indexes.clear();
+
+            for (ObjectIndex index : field.getParent().getIndexes()) {
+                if (index.getFields().contains(fieldName)) {
+                    indexes.add(index);
+                }
+            }
+
+            if (indexes.isEmpty()) {
+                throw new NoIndexException(field);
+            }
         }
 
         StandardMappedKey standardMappedKey = new StandardMappedKey();
@@ -689,11 +721,11 @@ public class Query<E> extends Record implements Cloneable, HtmlObject {
      *         {@code key} isn't indexed.
      */
     public MappedKey mapEmbeddedKey(DatabaseEnvironment environment, String key) {
-        return mapKey(environment, key, true);
+        return mapKey(environment, key, false);
     }
 
     public MappedKey mapDenormalizedKey(DatabaseEnvironment environment, String key) {
-        return mapKey(environment, key, false);
+        return mapKey(environment, key, true);
     }
 
     public interface MappedKey {
@@ -1065,13 +1097,27 @@ public class Query<E> extends Record implements Cloneable, HtmlObject {
             String code = codeBuilder.toString();
             writer.html(code);
 
-            writer.html(" (");
-                writer.start("a",
-                        "href", StringUtils.addQueryParameters("/_debug/code", "query", code, "objectClass", objectClass),
+            // Use a form instead of a link if the URL will be too long.
+            if (code.length() > 2000) {
+                writer.start("form",
+                        "method", "post",
+                        "action", "/_debug/code",
                         "target", "query");
-                    writer.html("Execute");
+                    writer.tag("input", "type", "hidden", "name", "query", "value", code);
+                    writer.tag("input", "type", "hidden", "name", "objectClass", "value", objectClass);
+                    writer.tag("input", "class", "btn", "type", "submit", "value", "Execute");
                 writer.end();
-            writer.html(")");
+
+            } else {
+                writer.html(" (");
+                    writer.start("a",
+                            "href", StringUtils.addQueryParameters("/_debug/code", "query", code, "objectClass", objectClass),
+                            "target", "query");
+                        writer.html("Execute");
+                    writer.end();
+                writer.html(")");
+            }
+
         writer.end();
     }
 
@@ -1304,6 +1350,10 @@ public class Query<E> extends Record implements Cloneable, HtmlObject {
 
     public Map<String, Object> getFacetedFields() {
         return this.facetedFields;
+    }
+
+    public HashSet<String> getExtraSourceColumns() {
+        return this.extraSourceColumns;
     }
 
     /** @deprecated Use {@link #delete} instead. */

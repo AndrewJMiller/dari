@@ -34,7 +34,18 @@ import javax.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/** Provides debugging tools for troubleshooting the application. */
+/**
+ * Provides debugging tools for troubleshooting the application.
+ *
+ * <p>This filter loads:</p>
+ *
+ * <ul>
+ * <li>{@link SettingsOverrideFilter}</li>
+ * <li>{@link SourceFilter}</li>
+ * <li>{@link LogCaptureFilter}</li>
+ * <li>{@link ResourceFilter}</li>
+ * </ul>
+ */
 public class DebugFilter extends AbstractFilter {
 
     public static final String DEFAULT_INTERCEPT_PATH = "/_debug/";
@@ -100,6 +111,8 @@ public class DebugFilter extends AbstractFilter {
     protected Iterable<Class<? extends Filter>> dependencies() {
         List<Class<? extends Filter>> dependencies = new ArrayList<Class<? extends Filter>>();
         dependencies.add(SettingsOverrideFilter.class);
+        dependencies.add(SourceFilter.class);
+        dependencies.add(LogCaptureFilter.class);
         dependencies.add(ResourceFilter.class);
         return dependencies;
     }
@@ -152,7 +165,7 @@ public class DebugFilter extends AbstractFilter {
                                 html("Can't render ");
                                 start("a",
                                         "target", "_blank",
-                                        "href", Static.getServletPath(page.getRequest(), "code",
+                                        "href", DebugFilter.Static.getServletPath(page.getRequest(), "code",
                                                 "action", "edit",
                                                 "type", "JSP",
                                                 "servletPath", servletPath));
@@ -474,6 +487,8 @@ public class DebugFilter extends AbstractFilter {
                 write(".CodeMirror .selected { background-color: #FCF8E3; }");
                 write(".CodeMirror .errorLine { background-color: #F2DEDE; }");
                 write(".CodeMirror .errorColumn { background-color: #B94A48; color: white; }");
+                write(".json { position: relative; }");
+                write(".json:after { background: #ccc; content: 'JSON'; font-size: 9px; line-height: 9px; padding: 4px; position: absolute; right: 0; top: 0; }");
             end();
 
             includeScript("/_resource/jquery/jquery-1.7.1.min.js");
@@ -502,7 +517,7 @@ public class DebugFilter extends AbstractFilter {
                     start("div", "class", "navbar-inner");
                         start("div", "class", "container-fluid");
                             start("span", "class", "brand");
-                                start("a", "href", Static.getServletPath(page.getRequest(), ""));
+                                start("a", "href", DebugFilter.Static.getServletPath(page.getRequest(), ""));
                                     html("Dari");
                                 end();
                                 if (!ObjectUtils.isBlank(titles)) {
@@ -543,22 +558,6 @@ public class DebugFilter extends AbstractFilter {
         public void endPage() throws IOException {
                 endBody();
             endHtml();
-        }
-
-        public void welcome() throws IOException {
-            startPage("Welcome!");
-                start("div", "class", "hero-unit", "style", "background: transparent; margin: 0 auto; padding-left: 0; padding-right: 0; width: 50em;");
-                    start("h2", "style", "margin-bottom: 20px;").html("Congratulations on installing Dari!").end();
-                    start("p").html("Dari is an intuitive Java development framework that takes care of a wide range of peripheral tasks to let developers focus on their application. Crafted over years of large-scale problem solving, Dari brings professional best practices into every developer’s workflow.").end();
-                    start("p", "style", "margin-top: 30px;");
-                        start("a",
-                                "class", "btn btn-large",
-                                "href", "http://www.dariframework.org/documentation.html");
-                            html("Let's get started \u2192");
-                        end();
-                    end();
-                end();
-            endPage();
         }
     }
 

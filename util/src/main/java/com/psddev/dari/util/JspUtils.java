@@ -23,6 +23,7 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 
 import javax.servlet.ServletContext;
@@ -33,6 +34,7 @@ import javax.servlet.http.Cookie;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import javax.servlet.http.HttpServletResponseWrapper;
+import javax.servlet.jsp.JspFactory;
 import javax.xml.bind.DatatypeConverter;
 
 import org.slf4j.Logger;
@@ -376,12 +378,28 @@ public class JspUtils {
             HttpServletRequest request,
             String name) {
 
+        return getSignedCookieWithExpiry(request, name, 0);
+    }
+
+    /**
+     * Returns the value of the signed cookie with the given {@code name} so
+     * long as the given {@code expirationDuration} has not been exceeded. A
+     * zero or negative {@code expirationDuration} signifies that the cookie
+     * does not expire.
+     *
+     * @see #setSignedCookie
+     */
+    public static String getSignedCookieWithExpiry(
+            HttpServletRequest request,
+            String name,
+            long expirationDuration) {
+
         Cookie cookie = getCookie(request, name);
         if (cookie == null) {
             return null;
 
         } else {
-            return unsignCookie(name, cookie.getValue());
+            return unsignCookieWithExpiry(name, cookie.getValue(), expirationDuration);
         }
     }
 
@@ -475,6 +493,15 @@ public class JspUtils {
      */
     public static boolean isIncluded(ServletRequest request) {
         return request.getAttribute("javax.servlet.include.context_path") != null;
+    }
+    
+    /**
+     * Returns {@code true} if the given {@code request} is made with
+     * SSL ({@code javax.Servlet.ServletRequest#isSecure()} returns {@code true} 
+     * or X-Forwarded-Proto header is "https").
+     */
+    public static boolean isSecureRequest(HttpServletRequest request) {
+        return (request.isSecure() || (request.getHeader("X-Forwarded-Proto") != null && request.getHeader("X-Forwarded-Proto").equalsIgnoreCase("https")));
     }
 
     /**
@@ -746,6 +773,17 @@ public class JspUtils {
      * cookie with the given {@code name}.
      */
     public static String unsignCookie(String name, String signedValue) {
+        return unsignCookieWithExpiry(name, signedValue, 0);
+    }
+
+    /**
+     * Unsigns the given {@code signedValue} that's associated to a
+     * cookie with the given {@code name} so long as the
+     * given {@code expirationDuration} has not been exceeded. A zero or
+     * negative {@code expirationDuration} signifies that the cookie does not
+     * expire.
+     */
+    public static String unsignCookieWithExpiry(String name, String signedValue, long expirationDuration) {
         String parts[] = StringUtils.split(signedValue, "\\|");
         if (parts.length != 3) {
             LOGGER.debug("Not a valid signed cookie! {}", signedValue);
@@ -762,8 +800,8 @@ public class JspUtils {
             return null;
         }
 
-        long expiration = System.currentTimeMillis() - 86400000;
-        if (timestamp < expiration) {
+        long expiration = System.currentTimeMillis() - expirationDuration;
+        if (expirationDuration > 0 && timestamp < expiration) {
             LOGGER.debug("Signature expired! {} < {}", timestamp, expiration);
             return null;
         }
@@ -783,7 +821,7 @@ public class JspUtils {
         @SuppressWarnings("unchecked")
         Map<String, String> contextPaths = (Map<String, String>) context.getAttribute(EMBEDDED_CONTEXT_PATHS);
         if (contextPaths == null) {
-            contextPaths = new HashMap<String, String>();
+            contextPaths = new ConcurrentHashMap<String, String>();
             context.setAttribute(EMBEDDED_CONTEXT_PATHS, contextPaths);
         }
 
@@ -1026,6 +1064,37 @@ public class JspUtils {
         response.setHeader("Location", response.encodeRedirectURL(getAbsolutePath(context, request, path == null ? null : path.toString(), parameters)));
     }
 
+    /**
+     * Wraps the default JSP factory using an instance of the the given
+     * {@code wrapperClass}.
+     */
+    public static void wrapDefaultJspFactory(Class<? extends JspFactoryWrapper> wrapperClass) {
+        JspFactory factory = JspFactory.getDefaultFactory();
+
+        for (JspFactory f = factory; f instanceof JspFactoryWrapper; f = ((JspFactoryWrapper) f).getDelegate()) {
+            if (wrapperClass.isInstance(f)) {
+                return;
+            }
+        }
+
+        JspFactoryWrapper wrapper = TypeDefinition.getInstance(wrapperClass).newInstance();
+
+        wrapper.setDelegate(factory);
+        JspFactory.setDefaultFactory(wrapper);
+    }
+
+    /**
+     * Unwraps the default JSP factory and restore the original default if
+     * it's an instance of the given {@code wrapperClass}.
+     */
+    public static void unwrapDefaultJspFactory(Class<? extends JspFactoryWrapper> wrapperClass) {
+        JspFactory factory = JspFactory.getDefaultFactory();
+
+        if (factory instanceof JspFactoryWrapper) {
+            JspFactory.setDefaultFactory(((JspFactoryWrapper) factory).getDelegate());
+        }
+    }
+
     // --- Deprecated ---
 
     /** @deprecated Use {@link #getEmbeddedAbsolutePath} instead. */
@@ -1053,13 +1122,13 @@ public class JspUtils {
     /** @deprecated Use {@link #getEmbeddedContextPath(ServletContext, String)} instead. */
     @Deprecated
     public static String getEmbeddedContextPath(ServletContext context, HttpServletRequest request) {
-        return getEmbeddedContextPath(context, request.getServletPath());
+        return getEmbeddedContextPath(context, getCurrentServletPath(request));
     }
 
     /** @deprecated Use {@link #getEmbeddedServletPath(ServletContext, String)} instead. */
     @Deprecated
     public static String getEmbeddedServletPath(ServletContext context, HttpServletRequest request) {
-        return getEmbeddedServletPath(context, request.getServletPath());
+        return getEmbeddedServletPath(context, getCurrentServletPath(request));
     }
 
     /** @deprecated Use {@link #getHost} instead. */
