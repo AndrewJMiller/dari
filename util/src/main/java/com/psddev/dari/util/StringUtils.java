@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -145,9 +146,9 @@ public class StringUtils {
         int m = 0, l = string.length();
         for (int i = 0; i < l; i++) {
             char c = string.charAt(i);
-            if (" -_.".indexOf(c) > -1) {
+            if (" -_.$".indexOf(c) > -1) {
                 words.add(string.substring(m, i).toLowerCase());
-                while (++i < l && " -_.".indexOf(string.charAt(i)) > -1) {
+                while (++i < l && " -_.$".indexOf(string.charAt(i)) > -1) {
                 }
                 m = i;
             } else if (Character.isUpperCase(c) && i > 0 && Character.isLowerCase(string.charAt(i - 1))) {
@@ -233,6 +234,10 @@ public class StringUtils {
 
         StringBuilder nb = new StringBuilder();
         for (String word : words) {
+            if (word.length() == 0) {
+                continue;
+            }
+
             if (ABBREVIATIONS.contains(word)) {
                 nb.append(word.toUpperCase());
             } else {
@@ -456,7 +461,7 @@ public class StringUtils {
             return null;
         }
         try {
-            return URLEncoder.encode(string, "UTF-8");
+            return URLEncoder.encode(string, "UTF-8").replace("+", "%20");
         } catch (UnsupportedEncodingException ex) {
             throw new IllegalStateException(ex);
         }
@@ -479,19 +484,49 @@ public class StringUtils {
      * {@code uri}.
      */
     public static String addQueryParameters(String uri, Object... parameters) {
-        int parametersLength;
-        if (uri == null || parameters == null || (parametersLength = parameters.length) == 0) {
-            return uri;
+        if (uri == null) {
+            return null;
         }
 
         // Convert "path?a=b&c=d" to "&a=b&c=d".
         StringBuilder query = new StringBuilder();
         int questionAt = uri.indexOf("?");
         if (questionAt > -1) {
-            query.append("&");
-            query.append(uri.substring(questionAt + 1));
+
+            String queryString = uri.substring(questionAt + 1);
+            int beginAt = 0;
+
+            // make sure all the query parameters are encoded
+            while (true) {
+                int ampIndex = queryString.indexOf('&', beginAt);
+
+                String param = queryString.substring(beginAt, ampIndex > -1 ? ampIndex : queryString.length());
+
+                if (!param.isEmpty() || ampIndex > -1) {
+                    query.append("&");
+
+                    int equalsIndex = param.indexOf('=');
+                    if (equalsIndex > -1) {
+                        query.append(encodeUri(decodeUri(param.substring(0, equalsIndex))));
+                        query.append("=");
+                        query.append(encodeUri(decodeUri(param.substring(equalsIndex+1))));
+
+                    } else {
+                        query.append(encodeUri(decodeUri(param)));
+                    }
+                }
+
+                if (ampIndex > -1) {
+                    beginAt = ampIndex+1;
+                } else {
+                    break;
+                }
+            }
+
             uri = uri.substring(0, questionAt);
         }
+
+        int parametersLength = parameters != null ? parameters.length : 0;
 
         for (int i = 0; i < parametersLength; i += 2) {
 
@@ -587,6 +622,59 @@ public class StringUtils {
         }
 
         return values;
+    }
+
+    /** Returns a map of query parameters from the given {@code url}. */
+    public static Map<String, List<String>> getQueryParameterMap(String url) {
+        Map<String, List<String>> map = new LinkedHashMap<String, List<String>>();
+
+        if (url != null) {
+            int questionAt = url.indexOf('?');
+
+            if (questionAt > -1) {
+                url = url.substring(questionAt + 1);
+            }
+
+            int lastAndAt = 0;
+
+            for (int andAt;
+                    (andAt = url.indexOf('&', lastAndAt)) > -1;
+                    lastAndAt = andAt + 1) {
+                addParameter(map, url.substring(lastAndAt, andAt));
+            }
+
+            addParameter(map, url.substring(lastAndAt));
+        }
+
+        return map;
+    }
+
+    private static void addParameter(Map<String, List<String>> map, String pair) {
+        if (pair == null || pair.length() == 0) {
+            return;
+        }
+
+        int equalAt = pair.indexOf('=');
+        String name;
+        String value;
+
+        if (equalAt > -1) {
+            name = decodeUri(pair.substring(0, equalAt));
+            value = decodeUri(pair.substring(equalAt + 1));
+
+        } else {
+            name = decodeUri(pair);
+            value = null;
+        }
+
+        List<String> parameters = map.get(name);
+
+        if (parameters == null) {
+            parameters = new ArrayList<String>();
+            map.put(name, parameters);
+        }
+
+        parameters.add(value);
     }
 
     /** @deprecated Use {@link #addQueryParameters instead}. */
@@ -976,5 +1064,91 @@ public class StringUtils {
             }
             return string;
         }
+    }
+
+    /**
+     * Removes the given {@code delimiter} if the given {@code string}
+     * starts with it.
+     *
+     * @param string If {@code null}, returns {@code null}.
+     * @param delimiter If {@code null}, returns the given {@code string}
+     * as is.
+     */
+    public static String removeStart(String string, String delimiter) {
+        if (string == null) {
+            return null;
+        } else if (delimiter == null) {
+            return string;
+        } else if (string.startsWith(delimiter)) {
+            string = string.substring(delimiter.length());
+        }
+        return string;
+    }
+
+    /**
+     * Removes the given {@code delimiter} if the given {@code string}
+     * ends with it.
+     *
+     * @param string If {@code null}, returns {@code null}.
+     * @param delimiter If {@code null}, returns the given {@code string}
+     * as is.
+     */
+    public static String removeEnd(String string, String delimiter) {
+        if (string == null) {
+            return null;
+        } else if (delimiter == null) {
+            return string;
+        } else if (string.endsWith(delimiter)) {
+            string = string.substring(0, string.length() - delimiter.length());
+        }
+        return string;
+    }
+
+    /**
+     * Removes the given {@code delimiter} if the given {@code string}
+     * starts or ends with it.
+     *
+     * @param string If {@code null}, returns {@code null}.
+     * @param delimiter If {@code null}, returns the given {@code string}
+     * as is.
+     */
+    public static String removeSurrounding(String string, String delimiter) {
+        if (string == null) {
+            return null;
+        } else if (delimiter == null) {
+            return string;
+        } else {
+            if (string.startsWith(delimiter)) {
+                string = string.substring(delimiter.length());
+            }
+            if (string.endsWith(delimiter)) {
+                string = string.substring(0, string.length() - delimiter.length());
+            }
+            return string;
+        }
+    }
+
+    /**
+     * @param path If {@code null}, returns {@code null}.
+     * @param servletPath If {@code null}, returns {@code null}.
+     */
+    public static String getPathInfo(String path, String servletPath) {
+        if (path != null && servletPath != null) {
+            path = ensureStart(path, "/");
+            servletPath = removeEnd(ensureStart(servletPath, "/"), "/");
+
+            if (path.startsWith(servletPath)) {
+                String pathInfo = path.substring(servletPath.length());
+
+                if (pathInfo.length() == 0) {
+                    return "/";
+
+                } else if (pathInfo.startsWith("/")) {
+                    return pathInfo;
+                }
+            }
+        }
+
+        return null;
     }
 }

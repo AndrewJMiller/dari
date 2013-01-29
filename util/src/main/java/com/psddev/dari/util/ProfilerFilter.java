@@ -120,6 +120,20 @@ public class ProfilerFilter extends AbstractFilter {
             long start)
             throws IOException {
 
+        Map<String, String> nameColors = new HashMap<String, String>();
+        Map<String, String> nameClasses = new HashMap<String, String>();
+        double goldenRatio = 0.618033988749895;
+        double hue = Math.random();
+        int index = 1;
+
+        for (String name : profiler.getEventStats().keySet()) {
+            hue += goldenRatio;
+            hue %= 1.0;
+            nameColors.put(name, "hsl(" + (hue * 360) + ",50%,50%)");
+            nameClasses.put(name, "event" + index);
+            ++ index;
+        }
+
         writer.start("div", "id", "_profile-result");
 
             writer.start("div", "class", "navbar navbar-fixed-top");
@@ -142,7 +156,7 @@ public class ProfilerFilter extends AbstractFilter {
 
                                 writer.start("thead");
                                     writer.start("tr");
-                                        writer.start("th").html("Event").end();
+                                        writer.start("th", "colspan", 2).html("Event").end();
                                         writer.start("th").html("Count").end();
                                         writer.start("th").html("Own Total").end();
                                         writer.start("th").html("Own Average").end();
@@ -151,12 +165,25 @@ public class ProfilerFilter extends AbstractFilter {
 
                                 writer.start("tbody");
                                     for (Map.Entry<String, Profiler.EventStats> entry : profiler.getEventStats().entrySet()) {
+                                        String name = entry.getKey();
                                         Profiler.EventStats stats = entry.getValue();
                                         int count = stats.getCount();
                                         double ownDuration = stats.getOwnDuration() / 1e6;
 
                                         writer.start("tr");
-                                            writer.start("td").start("span", "class", "label").html(entry.getKey()).end().end();
+                                            writer.start("td");
+                                                writer.tag("input",
+                                                        "type", "checkbox",
+                                                        "checked", "checked",
+                                                        "value", nameClasses.get(name));
+                                            writer.end();
+                                            writer.start("td");
+                                                writer.start("span",
+                                                        "class", "label",
+                                                        "style", "background: " + nameColors.get(name) + ";");
+                                                    writer.html(name);
+                                                writer.end();
+                                            writer.end();
                                             writer.start("td").object(count).end();
                                             writer.start("td").object(ownDuration).end();
                                             writer.start("td").object(ownDuration / count).end();
@@ -186,7 +213,7 @@ public class ProfilerFilter extends AbstractFilter {
 
                         writer.start("tbody");
                             for (Profiler.Event rootEvent : profiler.getRootEvents()) {
-                                writeEvent(writer, eventIndexes, start, 0, rootEvent);
+                                writeEvent(writer, eventIndexes, start, nameColors, nameClasses, 0, rootEvent);
                             }
                         writer.end();
 
@@ -202,7 +229,7 @@ public class ProfilerFilter extends AbstractFilter {
         writer.start("script", "type", "text/javascript");
             writer.write("(function() {");
                 writer.write("var profileScript = document.createElement('script');");
-                writer.write("profileScript.src = '/_resource/cms/profile.js';");
+                writer.write("profileScript.src = '/_resource/dari/profiler.js';");
                 writer.write("document.body.appendChild(profileScript);");
             writer.write("})();");
         writer.end();
@@ -212,11 +239,15 @@ public class ProfilerFilter extends AbstractFilter {
             HtmlWriter writer,
             Map<Profiler.Event, Integer> eventIndexes,
             long start,
+            Map<String, String> nameColors,
+            Map<String, String> nameClasses,
             int depth,
             Profiler.Event event)
             throws IOException {
 
-        writer.start("tr");
+        String name = event.getName();
+
+        writer.start("tr", "class", nameClasses.get(name));
 
             writer.start("td").html(eventIndexes.get(event)).end();
             writer.start("td").object((event.getStart() - start) / 1e6).end();
@@ -224,15 +255,22 @@ public class ProfilerFilter extends AbstractFilter {
             writer.start("td").object(event.getOwnDuration() / 1e6).end();
 
             writer.start("td", "class", "objects", "style", "padding-left: " + (depth * 30 + 5) + "px;");
-                writer.start("span", "class", "label").html(event.getName()).end();
+
+                writer.start("span",
+                        "class", "label",
+                        "style", "background: " + nameColors.get(name) + ";");
+                    writer.html(name);
+                writer.end();
+
                 for (Object item : event.getObjects()) {
                     writer.html(" \u2192 ");
                     writer.object(item);
                 }
+
             writer.end();
 
             for (Profiler.Event child : event.getChildren()) {
-                writeEvent(writer, eventIndexes,  start, depth + 1, child);
+                writeEvent(writer, eventIndexes, start, nameColors, nameClasses, depth + 1, child);
             }
 
         writer.end();

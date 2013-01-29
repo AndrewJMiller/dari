@@ -34,6 +34,7 @@ class SqlQuery {
     private String whereClause;
     private String havingClause;
     private String orderByClause;
+    private String extraSourceColumns;
     private List<String> orderBySelectColumns = new ArrayList<String>();
     private final List<Join> joins = new ArrayList<Join>();
     private final Map<Query<?>, String> subQueries = new LinkedHashMap<Query<?>, String>();
@@ -41,6 +42,7 @@ class SqlQuery {
 
     private boolean needsDistinct;
     private Join mysqlIndexHint;
+    private boolean forceLeftJoins;
 
     /**
      * Creates an instance that can translate the given {@code query}
@@ -115,10 +117,11 @@ class SqlQuery {
         return fieldBuilder.toString();
     }
 
-    private SqlQuery getOrCreateSubSqlQuery(Query<?> subQuery) {
+    private SqlQuery getOrCreateSubSqlQuery(Query<?> subQuery, boolean forceLeftJoins) {
         SqlQuery subSqlQuery = subSqlQueries.get(subQuery);
         if (subSqlQuery == null) {
             subSqlQuery = new SqlQuery(database, subQuery, aliasPrefix + "s" + subSqlQueries.size());
+            subSqlQuery.forceLeftJoins = forceLeftJoins;
             subSqlQuery.initializeClauses();
             subSqlQueries.put(subQuery, subSqlQuery);
         }
@@ -127,6 +130,23 @@ class SqlQuery {
 
     /** Initializes FROM, WHERE, and ORDER BY clauses. */
     private void initializeClauses() {
+
+        // Determine whether any of the fields are sourced somewhere else.
+        HashMap<String, ObjectField> sourceTables = new HashMap<String, ObjectField>();
+        Set<ObjectType> queryTypes = query.getConcreteTypes(database.getEnvironment());
+
+        if (queryTypes != null) {
+            for (ObjectType type : queryTypes) {
+                for (ObjectField field : type.getFields()) {
+                    SqlDatabase.FieldData fieldData = field.as(SqlDatabase.FieldData.class);
+
+                    if (fieldData.isIndexTableSource()) {
+                        sourceTables.put(fieldData.getIndexTable(), field);
+                    }
+                }
+            }
+        }
+
         String extraJoins = ObjectUtils.to(String.class, query.getOptions().get(SqlDatabase.EXTRA_JOINS_QUERY_OPTION));
 
         if (extraJoins != null) {
@@ -209,7 +229,7 @@ class SqlQuery {
                 Query<?> subQuery = mappedKeys.get(queryKey).getSubQueryWithSorter(sorter, 0);
 
                 if (subQuery != null) {
-                    SqlQuery subSqlQuery = getOrCreateSubSqlQuery(subQuery);
+                    SqlQuery subSqlQuery = getOrCreateSubSqlQuery(subQuery, true);
                     subQueries.put(subQuery, joinValueField + " = ");
                     orderByBuilder.append(subSqlQuery.orderByClause.substring(9));
                     orderByBuilder.append(", ");
@@ -248,20 +268,27 @@ class SqlQuery {
 
         // Builds the FROM clause.
         StringBuilder fromBuilder = new StringBuilder();
+        HashMap<String, String> joinTableAliases = new HashMap<String, String>();
 
         for (Join join : joins) {
             if (join.indexKeys.isEmpty()) {
                 continue;
             }
 
+            joinTableAliases.put(join.getTableName().toLowerCase(), join.getAlias());
+
             // e.g. JOIN RecordIndex AS i#
             fromBuilder.append("\n");
-            fromBuilder.append(join.type.token);
+            fromBuilder.append((forceLeftJoins ? JoinType.LEFT_OUTER : join.type).token);
             fromBuilder.append(" ");
             fromBuilder.append(join.table);
 
             if (join.type == JoinType.INNER && join.equals(mysqlIndexHint)) {
                 fromBuilder.append(" /*! USE INDEX (k_name_value) */");
+
+            } else if (join.sqlIndex == SqlIndex.LOCATION &&
+                    join.sqlIndexTable.getVersion() >= 2) {
+                fromBuilder.append(" /*! IGNORE INDEX (PRIMARY) */");
             }
 
             // e.g. ON i#.recordId = r.id AND i#.name = ...
@@ -284,17 +311,91 @@ class SqlQuery {
             fromBuilder.append(")");
         }
 
+        for (Map.Entry<String, ObjectField> entry: sourceTables.entrySet()) {
+            StringBuilder sourceTableNameBuilder = new StringBuilder();
+
+            vendor.appendIdentifier(sourceTableNameBuilder, entry.getKey());
+
+            String sourceTableName = sourceTableNameBuilder.toString();
+            ObjectField field = entry.getValue();
+            String sourceTableAlias;
+            StringBuilder keyNameBuilder = new StringBuilder(field.getParentType().getInternalName());
+
+            keyNameBuilder.append("/");
+            keyNameBuilder.append(field.getInternalName());
+
+            Query.MappedKey key = query.mapEmbeddedKey(database.getEnvironment(), keyNameBuilder.toString());
+            ObjectIndex useIndex = null;
+
+            for (ObjectIndex index : key.getIndexes()) {
+                if (index.getFields().get(0) == field.getInternalName()) {
+                    useIndex = index;
+                    break;
+                }
+            }
+
+            if (useIndex == null) {
+                continue;
+            }
+
+            SqlIndex useSqlIndex = SqlIndex.Static.getByIndex(useIndex);
+            SqlIndex.Table indexTable = useSqlIndex.getReadTable(database, useIndex);
+
+            // This table hasn't been joined to yet.
+            if (!joinTableAliases.containsKey(sourceTableName.toLowerCase())) {
+                sourceTableAlias = sourceTableName;
+                int symbolId = database.getSymbolId(key.getIndexKey(useIndex));
+
+                fromBuilder.append(" LEFT OUTER JOIN ");
+                fromBuilder.append(sourceTableName);
+                fromBuilder.append(" ON ");
+                fromBuilder.append(sourceTableName);
+                fromBuilder.append(".");
+                vendor.appendIdentifier(fromBuilder, "id");
+                fromBuilder.append(" = ");
+                fromBuilder.append(aliasPrefix);
+                fromBuilder.append("r.");
+                vendor.appendIdentifier(fromBuilder, "id");
+                fromBuilder.append(" AND ");
+                fromBuilder.append(sourceTableName);
+                fromBuilder.append(".");
+                vendor.appendIdentifier(fromBuilder, "symbolId");
+                fromBuilder.append(" = ");
+                fromBuilder.append(symbolId);
+
+            } else {
+                sourceTableAlias = joinTableAliases.get(sourceTableName.toLowerCase());
+            }
+
+            // Add columns to select.
+            int fieldIndex = 0;
+            StringBuilder extraColumnsBuilder = new StringBuilder();
+
+            for (String indexFieldName : useIndex.getFields()) {
+                String indexColumnName = indexTable.getValueField(database, useIndex, fieldIndex);
+
+                ++ fieldIndex;
+                query.getExtraSourceColumns().add(indexFieldName);
+
+                extraColumnsBuilder.append(sourceTableAlias);
+                extraColumnsBuilder.append(".");
+                vendor.appendIdentifier(extraColumnsBuilder, indexColumnName);
+                extraColumnsBuilder.append(" AS ");
+                vendor.appendIdentifier(extraColumnsBuilder, indexFieldName);
+                extraColumnsBuilder.append(", ");
+            }
+
+            extraColumnsBuilder.setLength(extraColumnsBuilder.length() - 2);
+            this.extraSourceColumns = extraColumnsBuilder.toString();
+        }
+
         for (Map.Entry<Query<?>, String> entry : subQueries.entrySet()) {
             Query<?> subQuery = entry.getKey();
-            SqlQuery subSqlQuery = getOrCreateSubSqlQuery(subQuery);
+            SqlQuery subSqlQuery = getOrCreateSubSqlQuery(subQuery, false);
 
             if (subSqlQuery.needsDistinct) {
                 needsDistinct = true;
             }
-
-            whereBuilder.append("\nAND (");
-            whereBuilder.append(subSqlQuery.whereClause.substring(7));
-            whereBuilder.append(')');
 
             fromBuilder.append("\nINNER JOIN ");
             vendor.appendIdentifier(fromBuilder, "Record");
@@ -320,6 +421,7 @@ class SqlQuery {
 
         this.orderByClause = orderByBuilder.toString();
         this.fromClause = fromBuilder.toString();
+
     }
 
     /** Adds the given {@code predicate} to the {@code WHERE} clause. */
@@ -454,8 +556,9 @@ class SqlQuery {
                         whereBuilder.append(")");
 
                     } else {
-                        whereBuilder.append("1 = 1");
+                        SqlQuery subSqlQuery = getOrCreateSubSqlQuery(valueQuery, join.type == JoinType.LEFT_OUTER);
                         subQueries.put(valueQuery, joinValueField + (isNotEqualsAll ? " != " : " = "));
+                        whereBuilder.append(subSqlQuery.whereClause.substring(7));
                     }
 
                     return;
@@ -837,9 +940,15 @@ class SqlQuery {
         }
 
         String extraColumns = ObjectUtils.to(String.class, query.getOptions().get(SqlDatabase.EXTRA_COLUMNS_QUERY_OPTION));
+
         if (extraColumns != null) {
             statementBuilder.append(", ");
             statementBuilder.append(extraColumns);
+        }
+
+        if (extraSourceColumns != null) {
+            statementBuilder.append(", ");
+            statementBuilder.append(extraSourceColumns);
         }
 
         statementBuilder.append("\nFROM ");
@@ -979,6 +1088,7 @@ class SqlQuery {
         public final List<String> indexKeys = new ArrayList<String>();
 
         private final String alias;
+        private final String tableName;
         private final ObjectIndex index;
         private final SqlIndex sqlIndex;
         private final SqlIndex.Table sqlIndexTable;
@@ -1002,6 +1112,7 @@ class SqlQuery {
                 valueField = recordIdField;
                 sqlIndexTable = null;
                 table = null;
+                tableName = null;
                 idField = null;
                 keyField = null;
 
@@ -1011,6 +1122,7 @@ class SqlQuery {
                 valueField = recordTypeIdField;
                 sqlIndexTable = null;
                 table = null;
+                tableName = null;
                 idField = null;
                 keyField = null;
 
@@ -1024,6 +1136,7 @@ class SqlQuery {
                 sqlIndexTable = this.sqlIndex.getReadTable(database, index);
 
                 table = null;
+                tableName = null;
                 idField = null;
                 keyField = null;
 
@@ -1036,6 +1149,7 @@ class SqlQuery {
 
                 StringBuilder tableBuilder = new StringBuilder();
                 vendor.appendIdentifier(tableBuilder, sqlIndexTable.getName(database, index));
+                tableName = tableBuilder.toString();
                 tableBuilder.append(" ");
                 tableBuilder.append(aliasPrefix);
                 tableBuilder.append(alias);
@@ -1044,6 +1158,14 @@ class SqlQuery {
                 idField = aliasedField(alias, sqlIndexTable.getIdField(database, index));
                 keyField = aliasedField(alias, sqlIndexTable.getKeyField(database, index));
             }
+        }
+
+        public String getAlias() {
+            return this.alias;
+        }
+
+        public String getTableName() {
+            return this.tableName;
         }
 
         public void addIndexKey(String queryKey) {

@@ -76,7 +76,7 @@ public abstract class AbstractDatabase<C> implements Database {
     private static final Logger LOGGER = LoggerFactory.getLogger(AbstractDatabase.class);
 
     private volatile String name;
-    private volatile DatabaseEnvironment environment;
+    private transient volatile DatabaseEnvironment environment;
     private volatile Set<String> groups;
     private volatile double readTimeout = DEFAULT_READ_TIMEOUT;
 
@@ -590,50 +590,101 @@ public abstract class AbstractDatabase<C> implements Database {
 
         protected abstract void doExecute(Record record);
 
+        @SuppressWarnings("unchecked")
         public final void execute(State state) {
             ObjectType type = state.getType();
+
             if (type == null) {
                 return;
             }
 
+            // Global modifications.
+            for (ObjectType modType : state.getDatabase().getEnvironment().getTypesByGroup(Modification.class.getName())) {
+                Class<?> modClass = modType.getObjectClass();
+
+                if (modClass != null &&
+                        Modification.class.isAssignableFrom(modClass) &&
+                        Modification.Static.getModifiedClasses((Class<? extends Modification<?>>) modClass).contains(Object.class)) {
+                    executeForModClass(state, modClass);
+                }
+            }
+
+            // Type-specific modifications.
             for (String modClassName : type.getModificationClassNames()) {
                 Class<?> modClass = ObjectUtils.getClassByName(modClassName);
-                if (modClass == null) {
-                    continue;
+
+                if (modClass != null) {
+                    executeForModClass(state, modClass);
+                }
+            }
+
+            // Embedded objects.
+            for (ObjectField field : type.getFields()) {
+                executeForValue(state.get(field.getInternalName()), field.isEmbedded());
+            }
+        }
+
+        private void executeForModClass(State state, Class<?> modClass) {
+            Object modObject;
+
+            try {
+                modObject = state.as(modClass);
+
+                if (!(modObject instanceof Record)) {
+                    return;
                 }
 
-                Object modObject;
-                try {
-                    modObject = state.as(modClass);
-                    if (!(modObject instanceof Record)) {
-                        continue;
-                    }
-                } catch (Exception ex) {
-                    continue;
+            } catch (Exception ex) {
+                return;
+            }
+
+            Record modRecord = (Record) modObject;
+            State modState = modRecord.getState();
+            Map<String, Object> extras = modState.getExtras();
+            @SuppressWarnings("unchecked")
+            Set<Class<?>> triggers = (Set<Class<?>>) extras.get(extraName);
+
+            if (triggers == null) {
+                triggers = new HashSet<Class<?>>();
+                extras.put(extraName, triggers);
+            }
+
+            if (triggers.contains(modClass)) {
+                LOGGER.debug(
+                        "Already triggered {} from [{}] on [{}]",
+                        new Object[] { name, modClass.getName(), modState.getId() });
+
+            } else {
+                LOGGER.debug(
+                        "Triggering {} from [{}] on [{}]",
+                        new Object[] { name, modClass.getName(), modState.getId() });
+                triggers.add(modClass);
+                doExecute(modRecord);
+            }
+        }
+
+        private void executeForValue(Object value, boolean embedded) {
+            if (value instanceof Map) {
+                value = ((Map<?, ?>) value).values();
+            }
+
+            if (value instanceof Iterable) {
+                for (Object item : (Iterable<?>) value) {
+                    executeForValue(item, embedded);
                 }
 
-                Record modRecord = (Record) modObject;
-                State modState = modRecord.getState();
-                Map<String, Object> extras = modState.getExtras();
-                @SuppressWarnings("unchecked")
-                Set<Class<?>> triggers = (Set<Class<?>>) extras.get(extraName);
+            } else if (value instanceof Recordable) {
+                State valueState = ((Recordable) value).getState();
 
-                if (triggers == null) {
-                    triggers = new HashSet<Class<?>>();
-                    extras.put(extraName, triggers);
-                }
-
-                if (triggers.contains(modClass)) {
-                    LOGGER.debug(
-                            "Already triggered {} from [{}] on [{}]",
-                            new Object[] { name, modClass.getName(), modState.getId() });
+                if (embedded) {
+                    execute(valueState);
 
                 } else {
-                    LOGGER.debug(
-                            "Triggering {} from [{}] on [{}]",
-                            new Object[] { name, modClass.getName(), modState.getId() });
-                    triggers.add(modClass);
-                    doExecute(modRecord);
+                    ObjectType valueType = valueState.getType();
+
+                    if (valueType != null && valueType.isEmbedded()) {
+                        execute(valueState);
+                    }
                 }
             }
         }
@@ -908,7 +959,16 @@ public abstract class AbstractDatabase<C> implements Database {
                             duplicateQuery.and(indexPrefix + fields.get(j) + " = ?", values[j]);
                         }
 
-                        Object duplicate = duplicateQuery.first();
+                        Object duplicate;
+                        boolean ignore = Database.Static.isIgnoreReadConnection();
+
+                        try {
+                            Database.Static.setIgnoreReadConnection(true);
+                            duplicate = duplicateQuery.first();
+                        } finally {
+                            Database.Static.setIgnoreReadConnection(ignore);
+                        }
+
                         if (duplicate == null) {
                             if (!beforeLocks) {
                                 continue;

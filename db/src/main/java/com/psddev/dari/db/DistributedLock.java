@@ -91,11 +91,20 @@ public class DistributedLock implements Lock {
         }
 
         synchronized (holderRef) {
-            State key = State.getInstance(Query.
-                    from(Object.class).
-                    where("_id = ?", keyId).
-                    using(database).
-                    first());
+            boolean oldIgnore = Database.Static.isIgnoreReadConnection();
+            State key;
+
+            try {
+                Database.Static.setIgnoreReadConnection(true);
+                key = State.getInstance(Query.
+                        from(Object.class).
+                        where("_id = ?", keyId).
+                        using(database).
+                        first());
+
+            } finally {
+                Database.Static.setIgnoreReadConnection(oldIgnore);
+            }
 
             if (key == null) {
                 key = new State();
@@ -140,20 +149,17 @@ public class DistributedLock implements Lock {
      */
     @Override
     public boolean tryLock(long time, TimeUnit unit) throws InterruptedException {
-        long remaining = unit.toMillis(time);
+        long end = System.currentTimeMillis() + unit.toMillis(time);
 
-        while (remaining > TRY_INTERVAL) {
+        do {
             if (tryLock()) {
                 return true;
-
             } else {
                 Thread.sleep(TRY_INTERVAL);
-                remaining -= TRY_INTERVAL;
             }
-        }
+        } while (System.currentTimeMillis() < end);
 
-        Thread.sleep(remaining);
-        return tryLock();
+        return false;
     }
 
     /**
@@ -183,7 +189,7 @@ public class DistributedLock implements Lock {
                         using(database).
                         first());
                 if (key != null && lockId.equals(key.get("lockId"))) {
-                    key.delete();
+                    key.deleteImmediately();
                 }
 
             } finally {

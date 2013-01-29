@@ -2,6 +2,7 @@ package com.psddev.dari.db;
 
 import com.psddev.dari.util.ObjectToIterable;
 import com.psddev.dari.util.ObjectUtils;
+import com.psddev.dari.util.PullThroughCache;
 import com.psddev.dari.util.StorageItem;
 import com.psddev.dari.util.StringUtils;
 import com.psddev.dari.util.TypeDefinition;
@@ -9,6 +10,7 @@ import com.psddev.dari.util.UuidUtils;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Type;
+import java.lang.reflect.TypeVariable;
 import java.net.URI;
 import java.net.URL;
 import java.util.ArrayList;
@@ -46,6 +48,8 @@ public class State implements Map<String, Object> {
     private static final int IS_ALL_RESOLVED_FLAG = 1 << 0;
     private static final int IS_RESOLVE_TO_REFERENCE_ONLY_FLAG = 1 << 1;
 
+    private static final ThreadLocal<List<Listener>> LISTENERS_LOCAL = new ThreadLocal<List<Listener>>();
+
     private final Map<Class<?>, Object> linkedObjects = new LinkedHashMap<Class<?>, Object>();
     private Database database;
     private UUID id;
@@ -54,7 +58,7 @@ public class State implements Map<String, Object> {
     private Map<String, Object> extras;
     private List<AtomicOperation> atomicOperations;
     private Map<ObjectField, List<String>> errors;
-    private int flags;
+    private volatile int flags;
 
     /**
      * Returns the state associated with the given {@code object}.
@@ -103,8 +107,21 @@ public class State implements Map<String, Object> {
     /** Returns the originating database. */
     public Database getDatabase() {
         if (database == null) {
-            setDatabase(Database.Static.getDefault());
+            Database defaultDatabase = Database.Static.getDefault();
+
+            setDatabase(defaultDatabase);
+
+            ObjectType type = getType();
+
+            if (type != null) {
+                Database source = type.getSourceDatabase();
+
+                if (source != null) {
+                    setDatabase(source);
+                }
+            }
         }
+
         return database;
     }
 
@@ -704,15 +721,39 @@ public class State implements Map<String, Object> {
         ObjectType type = getType();
         if (type != null) {
             for (ObjectField field : type.getFields()) {
-                Object value = getValue(field.getInternalName());
-                if (value instanceof Recordable) {
-                    State valueState = ((Recordable) value).getState();
-                    ObjectType valueType = valueState.getType();
-                    if ((field.isEmbedded() ||
-                            valueType.isEmbedded()) &&
-                            valueState.hasAnyErrors()) {
-                        return true;
-                    }
+                if (hasErrorsForValue(get(field.getInternalName()), field.isEmbedded())) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private boolean hasErrorsForValue(Object value, boolean embedded) {
+        if (value instanceof Map) {
+            value = ((Map<?, ?>) value).values();
+        }
+
+        if (value instanceof Iterable) {
+            for (Object item : (Iterable<?>) value) {
+                if (hasErrorsForValue(item, embedded)) {
+                    return true;
+                }
+            }
+
+        } else if (value instanceof Recordable) {
+            State valueState = ((Recordable) value).getState();
+
+            if (embedded) {
+                if (valueState.hasAnyErrors()) {
+                    return true;
+                }
+
+            } else {
+                ObjectType valueType = valueState.getType();
+                if (valueType != null && valueType.isEmbedded() && valueState.hasAnyErrors()) {
+                    return true;
                 }
             }
         }
@@ -928,6 +969,16 @@ public class State implements Map<String, Object> {
         return objects;
     }
 
+    public void beforeFieldGet(String name) {
+        List<Listener> listeners = LISTENERS_LOCAL.get();
+
+        if (listeners != null && !listeners.isEmpty()) {
+            for (Listener listener : listeners) {
+                listener.beforeFieldGet(this, name);
+            }
+        }
+    }
+
     /**
      * Resolves all references to other objects in this state. This method
      * shouldn't be used directly, because it's called automatically on
@@ -938,9 +989,17 @@ public class State implements Map<String, Object> {
             return;
         }
 
-        flags |= IS_ALL_RESOLVED_FLAG;
+        synchronized (this) {
+            if ((flags & IS_ALL_RESOLVED_FLAG) > 0) {
+                return;
+            }
 
-        if (!linkedObjects.isEmpty()) {
+            flags |= IS_ALL_RESOLVED_FLAG;
+
+            if (linkedObjects.isEmpty()) {
+                return;
+            }
+
             Object object = linkedObjects.values().iterator().next();
             Map<UUID, Object> references = StateValueUtils.resolveReferences(getDatabase(), object, rawValues.values());
             Map<String, Object> resolved = new HashMap<String, Object>();
@@ -968,15 +1027,7 @@ public class State implements Map<String, Object> {
         if (type != null) {
             for (ObjectField field : type.getFields()) {
                 field.validate(this);
-
-                Object value = getValue(field.getInternalName());
-                if (value instanceof Recordable) {
-                    State valueState = ((Recordable) value).getState();
-                    ObjectType valueType = valueState.getType();
-                    if (field.isEmbedded() || valueType.isEmbedded()) {
-                        valueState.validate();
-                    }
-                }
+                validateValue(get(field.getInternalName()), field.isEmbedded());
             }
         }
 
@@ -986,6 +1037,31 @@ public class State implements Map<String, Object> {
         }
 
         return !hasAnyErrors();
+    }
+
+    private void validateValue(Object value, boolean embedded) {
+        if (value instanceof Map) {
+            value = ((Map<?, ?>) value).values();
+        }
+
+        if (value instanceof Iterable) {
+            for (Object item : (Iterable<?>) value) {
+                validateValue(item, embedded);
+            }
+
+        } else if (value instanceof Recordable) {
+            State valueState = ((Recordable) value).getState();
+
+            if (embedded) {
+                valueState.validate();
+
+            } else {
+                ObjectType valueType = valueState.getType();
+                if (valueType != null && valueType.isEmbedded()) {
+                    valueState.validate();
+                }
+            }
+        }
     }
 
     private void copyJavaFieldsToRawValues() {
@@ -1062,8 +1138,13 @@ public class State implements Map<String, Object> {
                 }
             }
 
-            Object converted = ObjectUtils.to(javaFieldType, value);
-            javaField.set(object, converted);
+            Object converted = javaFieldType instanceof TypeVariable ? value : ObjectUtils.to(javaFieldType, value);
+
+            try {
+                javaField.set(object, converted);
+            } catch (IllegalArgumentException error) {
+                converted = null;
+            }
 
             if (converted == null) {
                 rawValues.put("dari.trash." + key, value);
@@ -1298,6 +1379,28 @@ public class State implements Map<String, Object> {
         return sb.toString();
     }
 
+    // --- JSTL support ---
+
+    private transient Map<String, Object> modifications;
+
+    public Map<String, Object> getAs() {
+        if (modifications == null) {
+            modifications = new PullThroughCache<String, Object>() {
+                @Override
+                protected Object produce(String modificationClassName) {
+                    Class<?> modificationClass = ObjectUtils.getClassByName(modificationClassName);
+                    if (modificationClass != null) {
+                        return as(modificationClass);
+                    } else {
+                        throw new IllegalArgumentException(String.format(
+                                "[%s] isn't a valid class name!", modificationClassName));
+                    }
+                }
+            };
+        }
+        return modifications;
+    }
+    
     // --- Database bridge ---
 
     /** @see Database#beginWrites() */
@@ -1376,6 +1479,56 @@ public class State implements Map<String, Object> {
      */
     public void delete() {
         getDatabase().delete(this);
+    }
+
+    /**
+     * Deletes this state {@linkplain Database#beginIsolatedWrites immediately}
+     * from the {@linkplain #getDatabase originating database}.
+     */
+    public void deleteImmediately() {
+        Database database = getDatabase();
+        database.beginIsolatedWrites();
+        try {
+            database.delete(this);
+            database.commitWrites();
+        } finally {
+            database.endWrites();
+        }
+    }
+
+    public static abstract class Listener {
+        public void beforeFieldGet(State state, String name) {
+        }
+    }
+
+    /** {@link State} utility methods. */
+    public static final class Static {
+
+        private Static() {
+        }
+
+        public static void addListener(Listener listener) {
+            List<Listener> listeners = LISTENERS_LOCAL.get();
+
+            if (listeners == null) {
+                listeners = new ArrayList<Listener>();
+                LISTENERS_LOCAL.set(listeners);
+            }
+
+            listeners.add(listener);
+        }
+
+        public static void removeListener(Listener listener) {
+            List<Listener> listeners = LISTENERS_LOCAL.get();
+
+            if (listeners != null) {
+                listeners.remove(listener);
+
+                if (listeners.isEmpty()) {
+                    LISTENERS_LOCAL.remove();
+                }
+            }
+        }
     }
 
     // --- Deprecated ---

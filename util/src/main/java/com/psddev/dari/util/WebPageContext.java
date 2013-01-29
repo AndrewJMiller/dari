@@ -1,7 +1,6 @@
 package com.psddev.dari.util;
 
 import java.io.IOException;
-import java.io.Writer;
 import java.lang.reflect.Array;
 import java.lang.reflect.Type;
 import java.util.ArrayList;
@@ -27,7 +26,7 @@ public class WebPageContext {
     private final ServletContext servletContext;
     private final HttpServletRequest request;
     private final HttpServletResponse response;
-    private final Writer writer;
+    private HtmlWriter writer;
     private Converter converter;
 
     /**
@@ -42,7 +41,7 @@ public class WebPageContext {
         this.servletContext = pageContext.getServletContext();
         this.request = (HttpServletRequest) pageContext.getRequest();
         this.response = (HttpServletResponse) pageContext.getResponse();
-        this.writer = pageContext.getOut();
+        this.writer = new HtmlWriter(pageContext.getOut());
     }
 
     /**
@@ -50,8 +49,6 @@ public class WebPageContext {
      * {@code request}, {@code response}.
      *
      * @param servlet Can't be {@code null}.
-     * @param request Can't be {@code null}.
-     * @param response Can't be {@code null}.
      */
     public WebPageContext(
             Servlet servlet,
@@ -59,8 +56,6 @@ public class WebPageContext {
             HttpServletResponse response) {
 
         ErrorUtils.errorIfNull(servlet, "servlet");
-        ErrorUtils.errorIfNull(request, "request");
-        ErrorUtils.errorIfNull(response, "response");
 
         this.page = servlet;
         this.servletContext = servlet.getServletConfig().getServletContext();
@@ -72,19 +67,11 @@ public class WebPageContext {
     /**
      * Creates an instance based on the given {@code servletContext},
      * {@code request}, and {@code response}.
-     *
-     * @param servletContext Can't be {@code null}.
-     * @param request Can't be {@code null}.
-     * @param response Can't be {@code null}.
      */
     public WebPageContext(
             ServletContext servletContext,
             HttpServletRequest request,
             HttpServletResponse response) {
-
-        ErrorUtils.errorIfNull(servletContext, "servletContext");
-        ErrorUtils.errorIfNull(request, "request");
-        ErrorUtils.errorIfNull(response, "response");
 
         this.page = null;
         this.servletContext = servletContext;
@@ -125,8 +112,11 @@ public class WebPageContext {
      *
      * @return Never {@code null}.
      */
-    public Writer getWriter() throws IOException {
-        return writer != null ? writer : response.getWriter();
+    public HtmlWriter getWriter() throws IOException {
+        if (writer == null) {
+            writer = new HtmlWriter(getResponse().getWriter());
+        }
+        return writer;
     }
 
     /**

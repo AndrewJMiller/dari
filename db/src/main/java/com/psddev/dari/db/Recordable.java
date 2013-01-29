@@ -8,6 +8,7 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
+import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -26,6 +27,12 @@ public interface Recordable {
      * unlink} the state previously set.
      */
     public void setState(State state);
+
+    /**
+     * Returns an instance of the given {@code modificationClass} linked
+     * to this object.
+     */
+    public <T> T as(Class<T> modificationClass);
 
     // --- Annotations ---
 
@@ -67,9 +74,10 @@ public interface Recordable {
     @Inherited
     @ObjectField.AnnotationProcessorClass(DenormalizedProcessor.class)
     @Retention(RetentionPolicy.RUNTIME)
-    @Target(ElementType.FIELD)
+    @Target({ ElementType.FIELD, ElementType.TYPE })
     public @interface Denormalized {
         boolean value() default true;
+        String[] fields() default { };
     }
 
     /** Specifies the target's display name. */
@@ -207,6 +215,26 @@ public interface Recordable {
     @Target(ElementType.FIELD)
     public @interface Required {
         boolean value() default true;
+    }
+
+    /** Specifies the source database class for the target type. */
+    @Documented
+    @Inherited
+    @ObjectType.AnnotationProcessorClass(SourceDatabaseClassProcessor.class)
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target(ElementType.TYPE)
+    public @interface SourceDatabaseClass {
+        Class<? extends Database> value();
+    }
+
+    /** Specifies the source database name for the target type. */
+    @Documented
+    @Inherited
+    @ObjectType.AnnotationProcessorClass(SourceDatabaseNameProcessor.class)
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target(ElementType.TYPE)
+    public @interface SourceDatabaseName {
+        String value();
     }
 
     /**
@@ -466,10 +494,20 @@ class CollectionMinimumProcessor implements ObjectField.AnnotationProcessor<Anno
     }
 }
 
-class DenormalizedProcessor implements ObjectField.AnnotationProcessor<Recordable.Denormalized> {
+class DenormalizedProcessor implements
+        ObjectField.AnnotationProcessor<Recordable.Denormalized>,
+        ObjectType.AnnotationProcessor<Recordable.Denormalized> {
+
     @Override
     public void process(ObjectType type, ObjectField field, Recordable.Denormalized annotation) {
         field.setDenormalized(annotation.value());
+        Collections.addAll(field.getDenormalizedFields(), annotation.fields());
+    }
+
+    @Override
+    public void process(ObjectType type, Recordable.Denormalized annotation) {
+        type.setDenormalized(annotation.value());
+        Collections.addAll(type.getDenormalizedFields(), annotation.fields());
     }
 }
 
@@ -477,12 +515,8 @@ class DenormalizedFieldsProcessor implements ObjectType.AnnotationProcessor<Anno
     @Override
     @SuppressWarnings({ "all", "deprecation" })
     public void process(ObjectType type, Annotation annotation) {
-        for (String fieldName : ((Recordable.DenormalizedFields) annotation).value()) {
-            ObjectField field = type.getField(fieldName);
-            if (field != null) {
-                field.setDenormalized(true);
-            }
-        }
+        type.setDenormalized(true);
+        Collections.addAll(type.getDenormalizedFields(), ((Recordable.DenormalizedFields) annotation).value());
     }
 }
 
@@ -571,14 +605,7 @@ class MinimumProcessor implements ObjectField.AnnotationProcessor<Annotation> {
 class PreviewFieldProcessor implements ObjectType.AnnotationProcessor<Recordable.PreviewField> {
     @Override
     public void process(ObjectType type, Recordable.PreviewField annotation) {
-        String fieldName = annotation.value();
-        ObjectField field = type.getField(fieldName);
-        if (field != null && ObjectField.FILE_TYPE.equals(field.getInternalType())) {
-            type.setPreviewField(fieldName);
-        } else {
-            throw new IllegalArgumentException(
-                    "[%s] annotation cannot be applied to a non-file field!");
-        }
+        type.setPreviewField(annotation.value());
     }
 }
 
@@ -599,6 +626,20 @@ class RequiredProcessor implements ObjectField.AnnotationProcessor<Annotation> {
         field.setRequired(annotation instanceof Recordable.FieldRequired ?
                 ((Recordable.FieldRequired) annotation).value() :
                 ((Recordable.Required) annotation).value());
+    }
+}
+
+class SourceDatabaseClassProcessor implements ObjectType.AnnotationProcessor<Recordable.SourceDatabaseClass> {
+    @Override
+    public void process(ObjectType type, Recordable.SourceDatabaseClass annotation) {
+        type.setSourceDatabaseClassName(annotation.value().getName());
+    }
+}
+
+class SourceDatabaseNameProcessor implements ObjectType.AnnotationProcessor<Recordable.SourceDatabaseName> {
+    @Override
+    public void process(ObjectType type, Recordable.SourceDatabaseName annotation) {
+        type.setSourceDatabaseName(annotation.value());
     }
 }
 
